@@ -1413,6 +1413,38 @@
         background: var(--warn-soft);
       }
 
+      /* Per-task Rocketlane sync badge, painted by the status-change QUEUE:
+         "⏳ Queued" (waiting its turn) → spinning "Syncing to Rocketlane…" →
+         green "✓ Synced to Rocketlane" (clears itself after a few seconds) or
+         red "⚠ Rocketlane sync failed". Own line below the task title, same
+         placement rationale as .notInRocketlane above. */
+      .tag.taskSyncBadge {
+        align-self: flex-start;
+        margin-top: 4px;
+        padding: 2px 8px;
+        font-size: 10px;
+        white-space: nowrap;
+        display: inline-flex;
+        align-items: center;
+        gap: 5px;
+      }
+      .tag.taskSyncBadge.queued { color: var(--muted); background: var(--accent-soft); }
+      .tag.taskSyncBadge.syncing { color: var(--warn); background: var(--warn-soft); }
+      /* Same SVG-mask refresh icon as .tag.rlSyncQuiet, spinning while the
+         PATCH for this task is in flight. */
+      .tag.taskSyncBadge.syncing::before {
+        content: "";
+        display: inline-block;
+        width: 11px;
+        height: 11px;
+        background-color: currentColor;
+        -webkit-mask: url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'><path fill='black' d='M13.65 2.35a.5.5 0 0 1 .85.35V6a.5.5 0 0 1-.5.5h-3.3a.5.5 0 0 1-.35-.85l1.05-1.06A5 5 0 0 0 3 8a1 1 0 1 1-2 0 7 7 0 0 1 11.55-5.31l1.1-1.34ZM2.35 13.65A.5.5 0 0 1 1.5 13.3V10a.5.5 0 0 1 .5-.5h3.3a.5.5 0 0 1 .35.85L4.6 11.41A5 5 0 0 0 13 8a1 1 0 1 1 2 0 7 7 0 0 1-11.55 5.31l-1.1.34Z'/></svg>") no-repeat center / 10px 10px;
+                mask: url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'><path fill='black' d='M13.65 2.35a.5.5 0 0 1 .85.35V6a.5.5 0 0 1-.5.5h-3.3a.5.5 0 0 1-.35-.85l1.05-1.06A5 5 0 0 0 3 8a1 1 0 1 1-2 0 7 7 0 0 1 11.55-5.31l1.1-1.34ZM2.35 13.65A.5.5 0 0 1 1.5 13.3V10a.5.5 0 0 1 .5-.5h3.3a.5.5 0 0 1 .35.85L4.6 11.41A5 5 0 0 0 13 8a1 1 0 1 1 2 0 7 7 0 0 1-11.55 5.31l-1.1.34Z'/></svg>") no-repeat center / 10px 10px;
+        animation: rlSyncSpin 1s linear infinite;
+      }
+      .tag.taskSyncBadge.synced { color: var(--good); background: rgba(52, 211, 153, 0.14); }
+      .tag.taskSyncBadge.failed { color: var(--bad); background: var(--bad-soft); }
+
       @keyframes assistPulse {
         0%, 100% {
           box-shadow: 0 0 0 0 rgba(251, 191, 36, 0);
@@ -26585,14 +26617,14 @@
             completeAllBtn.type = "button";
             completeAllBtn.textContent = "✓ Complete all";
             completeAllBtn.title = "Mark all " + openTasksNow.length +
-              " open task(s) in this category as completed (syncs to Rocketlane)";
+              " open task(s) in this category as completed (syncs to Rocketlane one task at a time)";
             completeAllBtn.addEventListener("click", () => {
               const open = (p.tasksByArea?.[area] ?? [])
                 .filter((t) => normalizeTaskStatus(t?.status) !== "completed");
               if (!open.length) return;
               if (!confirm(
                 "Complete all " + open.length + " open task(s) in '" + labelForArea(area, p) + "'?\n\n" +
-                "Each completion syncs to Rocketlane.",
+                "They sync to Rocketlane one at a time — each task shows Queued / Syncing / ✓ Synced.",
               )) return;
               // Subtasks first, then parents — completing a parent while its
               // children are open can be rejected by Rocketlane.
@@ -27214,6 +27246,16 @@
                   : "Not created in Rocketlane yet — retried on every sync.";
                 txt.appendChild(unsynced);
               }
+              // Rocketlane sync-queue badge — setTaskSyncBadge paints it while
+              // a status change for this task is queued / syncing / just
+              // synced; hidden otherwise. Re-registered on every render so the
+              // badge survives the re-renders the queue causes.
+              const syncBadge = document.createElement("span");
+              syncBadge.className = "tag taskSyncBadge";
+              syncBadge.hidden = true;
+              taskSyncBadgeEls.set(String(t.id), syncBadge);
+              txt.appendChild(syncBadge);
+              paintTaskSyncBadge(String(t.id));
               const metaBits = [];
               if (t.meta?.phase) metaBits.push("Phase: " + t.meta.phase);
               if (t.meta?.status) metaBits.push("Status: " + t.meta.status);
@@ -28434,6 +28476,107 @@
         return false;
       }
 
+      // ---- Rocketlane task-status sync QUEUE + per-task badges --------------
+      // Status changes used to fire their Rocketlane PATCH immediately, so
+      // completing several tasks (or "✓ Complete all") ran every request at
+      // once. They now go through a strict FIFO queue: ONE task finishes
+      // syncing before the next one starts. Each affected task row shows where
+      // it is via a .taskSyncBadge under its title — "⏳ Queued" → spinning
+      // "Syncing to Rocketlane…" → green "✓ Synced to Rocketlane" (clears
+      // itself) or red "⚠ Rocketlane sync failed" (the status reverts exactly
+      // as before). When the queue drains, ONE toast summarises the batch
+      // instead of a toast per task. A job whose task got ANOTHER status
+      // change while waiting is skipped via the existing per-task sync tokens.
+      const taskSyncBadgeState = new Map(); // local task id -> { st, at }
+      const taskSyncBadgeEls = new Map();   // local task id -> badge element (re-registered on every render)
+      const TASK_SYNC_BADGE_TEXT = {
+        queued: "⏳ Queued — waiting for previous task",
+        syncing: "Syncing to Rocketlane…",
+        synced: "✓ Synced to Rocketlane",
+        failed: "⚠ Rocketlane sync failed",
+      };
+      function paintTaskSyncBadge(taskId) {
+        const el = taskSyncBadgeEls.get(String(taskId));
+        if (!el || !el.isConnected) return;
+        const cur = taskSyncBadgeState.get(String(taskId));
+        if (!cur) { el.hidden = true; return; }
+        el.className = "tag taskSyncBadge " + cur.st;
+        el.textContent = TASK_SYNC_BADGE_TEXT[cur.st] || String(cur.st);
+        el.hidden = false;
+      }
+      function setTaskSyncBadge(taskId, st) {
+        const tid = String(taskId);
+        if (!st) taskSyncBadgeState.delete(tid);
+        else taskSyncBadgeState.set(tid, { st, at: Date.now() });
+        paintTaskSyncBadge(tid);
+        // Terminal states clear themselves so rows don't stay decorated.
+        if (st === "synced" || st === "failed") {
+          const stamp = taskSyncBadgeState.get(tid);
+          setTimeout(() => {
+            if (taskSyncBadgeState.get(tid) === stamp) {
+              taskSyncBadgeState.delete(tid);
+              paintTaskSyncBadge(tid);
+            }
+          }, st === "synced" ? 5000 : 10000);
+        }
+      }
+      const rocketlaneTaskStatusSyncQueue = [];
+      let rocketlaneTaskStatusSyncActive = false;
+      let rocketlaneTaskStatusSyncBatch = { ok: 0, failed: 0 };
+      function enqueueRocketlaneTaskStatusSync(job) {
+        rocketlaneTaskStatusSyncQueue.push(job);
+        setTaskSyncBadge(job.taskId, "queued");
+        void pumpRocketlaneTaskStatusSyncQueue();
+      }
+      async function pumpRocketlaneTaskStatusSyncQueue() {
+        if (rocketlaneTaskStatusSyncActive) return;
+        rocketlaneTaskStatusSyncActive = true;
+        try {
+          while (rocketlaneTaskStatusSyncQueue.length) {
+            const job = rocketlaneTaskStatusSyncQueue.shift();
+            // A newer status change for the same task supersedes this job.
+            if (!rocketlaneIsLatestTaskStatusSync(job.rlTaskId, job.token)) {
+              setTaskSyncBadge(job.taskId, null);
+              continue;
+            }
+            setTaskSyncBadge(job.taskId, "syncing");
+            try {
+              await rocketlaneUpdateTaskStatus(job.rlTaskId, job.next);
+              if (!rocketlaneIsLatestTaskStatusSync(job.rlTaskId, job.token)) {
+                setTaskSyncBadge(job.taskId, null);
+                continue;
+              }
+              rocketlaneTaskStatusSyncBatch.ok += 1;
+              setTaskSyncBadge(job.taskId, "synced");
+            } catch (e) {
+              if (!rocketlaneIsLatestTaskStatusSync(job.rlTaskId, job.token)) {
+                setTaskSyncBadge(job.taskId, null);
+                continue;
+              }
+              rocketlaneTaskStatusSyncBatch.failed += 1;
+              setTaskSyncBadge(job.taskId, "failed");
+              // The per-job handler (dead-link cleanup / revert) must never
+              // kill the queue for the tasks still waiting behind it.
+              try { job.onError(e); } catch (_) {}
+            }
+          }
+        } finally {
+          rocketlaneTaskStatusSyncActive = false;
+          const b = rocketlaneTaskStatusSyncBatch;
+          rocketlaneTaskStatusSyncBatch = { ok: 0, failed: 0 };
+          if (b.ok || b.failed) {
+            rocketlaneShowMessage(
+              b.failed
+                ? "Rocketlane: " + b.ok + " status change(s) synced, " + b.failed + " failed."
+                : (b.ok === 1
+                    ? "Rocketlane status updated ✓"
+                    : "Rocketlane: all " + b.ok + " status changes synced ✓"),
+              b.failed ? "error" : "info",
+            );
+          }
+        }
+      }
+
       function setTaskStatus(projectId, area, taskId, status, opts) {
         const p = state.projects.find((x) => x.id === projectId);
         if (!p) return;
@@ -28454,14 +28597,15 @@
         const isRocketlaneVisualOnlyStatus = next === "need_assistance";
         if (!skipRocketlane && rlTaskId && !isRocketlaneVisualOnlyStatus) {
           const token = rocketlaneBumpTaskStatusSyncToken(rlTaskId);
-          (async () => {
-            try {
-              await rocketlaneUpdateTaskStatus(rlTaskId, next);
-              if (!rocketlaneIsLatestTaskStatusSync(rlTaskId, token)) return;
-              rocketlaneShowMessage("Rocketlane status updated.", "info");
-            } catch (e) {
-              if (!rocketlaneIsLatestTaskStatusSync(rlTaskId, token)) return;
-
+          // FIFO queue: one task's Rocketlane sync completes before the next
+          // starts; the queue paints the per-task queued/syncing/synced badge
+          // and shows one summary toast when the batch drains.
+          enqueueRocketlaneTaskStatusSync({
+            taskId: String(taskId),
+            rlTaskId,
+            token,
+            next,
+            onError: (e) => {
               // The linked Rocketlane task is gone (deleted / access-restricted).
               // Reverting here was the cause of "I can't change a subtask's
               // status": the status snapped back and nothing reached Rocketlane.
@@ -28493,8 +28637,8 @@
 
               // Revert local status to keep tracker consistent with Rocketlane.
               setTaskStatus(projectId, area, taskId, prev, { skipRocketlane: true });
-            }
-          })();
+            },
+          });
         }
       }
 
